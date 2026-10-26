@@ -142,6 +142,11 @@ def open_website(url):
     webbrowser.open(url)
     return f"Opened {url}"
 
+@tool("Open a steam aplication")
+def open_steam():
+    steam_path = r"C:\Program Files (x86)\Steam\Steam.exe"
+    subprocess.Popen(steam_path)
+    return "Steam opened"
 
 @tool("Search YouTube and open the results page in the browser. Use this whenever the "
       "user asks to open, search or look up something on YouTube. Argument: only the "
