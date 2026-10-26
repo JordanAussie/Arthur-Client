@@ -135,13 +135,18 @@ def tool(description, takes_args=False, name=None):
 def get_time():
     return datetime.now().strftime("It is %I:%M %p on %A, %B %d.")
 
+@tool("Search on google to find information. Argument: the search query.", takes_args=True)
+def search_google(query):
+    query = query.replace(" ", "+")
+    webbrowser.open(f'https://www.google.com/search?q={query}')
+    return f"Searched"
 
 @tool("Open a website in the browser. Argument: the URL or site name. For YouTube searches use open_youtube instead.", takes_args=True)
 def open_website(url):
     if not url.startswith("http"):
         url = "https://" + url
     webbrowser.open(url)
-    return f"Opened {url}"
+    return f"Opened url"
 
 @tool("Open a steam aplication")
 def open_steam():
