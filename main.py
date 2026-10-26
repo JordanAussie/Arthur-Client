@@ -35,6 +35,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import tkinter as tk
 import wave
@@ -134,12 +135,27 @@ def get_time():
     return datetime.now().strftime("It is %I:%M %p on %A, %B %d.")
 
 
-@tool("Open a website in the browser. Argument: the URL or site name.", takes_args=True)
+@tool("Open a website in the browser. Argument: the URL or site name. For YouTube searches use open_youtube instead.", takes_args=True)
 def open_website(url):
     if not url.startswith("http"):
         url = "https://" + url
     webbrowser.open(url)
     return f"Opened {url}"
+
+
+@tool("Search YouTube and open the results page in the browser. Use this whenever the "
+      "user asks to open, search or look up something on YouTube. Argument: only the "
+      "search words (for example 'minecraft videos'), without 'search for' or 'on YouTube'. "
+      "Leave the argument empty to just open YouTube.", takes_args=True)
+def open_youtube(query=""):
+    query = query.strip()
+    if not query:
+        webbrowser.open("https://www.youtube.com")
+        return "Opened YouTube."
+    # quote_plus turns spaces into + : https://www.youtube.com/results?search_query=minecrafty+vid
+    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query)
+    webbrowser.open(url)
+    return f"Opened YouTube search results for {query}."
 
 
 # --- automatic discovery ----------------------------------------------------
@@ -657,6 +673,8 @@ def voice_loop(ui_q, stop):
         speaker.end(answer)
 
     SetLogLevel(-1)
+    rec_end = 0.45 if SPEAK_REPLIES else 0.95
+    ui_q.put(("loading", (0.10, rec_end, "Loading speech recognition...")))
     recognizer = KaldiRecognizer(Model(VOSK_MODEL_PATH), SAMPLE_RATE)
     audio_q = queue.Queue()
 
@@ -664,7 +682,10 @@ def voice_loop(ui_q, stop):
         if not muted.is_set():
             audio_q.put(bytes(indata))
 
+    if SPEAK_REPLIES:
+        ui_q.put(("loading", (0.45, 0.95, "Loading voice...")))
     speaker.load()  # load the voice into memory once
+    ui_q.put(("ready", None))
 
     awaiting_command = False
     last_partial = ""
@@ -738,7 +759,10 @@ class ArthurUI:
     def __init__(self, root, ui_q):
         self.root = root
         self.ui_q = ui_q
-        self.mode = "idle"  # "idle" = one panel, "active" = two panels
+        self.mode = "loading"  # "loading" = startup bar, "idle" = one panel, "active" = two panels
+        self.progress = 0.0            # loading bar, 0..1
+        self.stage_start, self.stage_end = 0.0, 0.1
+        self.loading_label = "Starting..."
         self.transcript = ""
         self.response = ""
         self._idle_job = None
@@ -799,8 +823,28 @@ class ArthurUI:
                     changed = True
                 elif kind == "idle":
                     self.go_idle()
+                elif kind == "loading":
+                    start, end, label = value
+                    self.mode = "loading"
+                    self.stage_start, self.stage_end = start, end
+                    self.progress = max(self.progress, start)
+                    self.loading_label = label
+                    changed = True
+                elif kind == "ready":
+                    self.progress = 1.0
+                    self.loading_label = "Ready."
+                    changed = True
+                    self.root.after(600, self._finish_loading)
         except queue.Empty:
             pass
+
+        if self.mode == "loading":
+            # Loading steps don't report real progress, so the bar creeps toward the
+            # end of the current step and never quite reaches it until the step is done.
+            if self.loading_label != "Ready.":
+                ceiling = self.stage_end - 0.03 * (self.stage_end - self.stage_start)
+                self.progress += (ceiling - self.progress) * 0.03
+            changed = True
         if changed:
             self.draw()
         self.root.after(40, self.poll)
@@ -809,6 +853,10 @@ class ArthurUI:
         if self._idle_job:
             self.root.after_cancel(self._idle_job)
         self._idle_job = self.root.after(IDLE_TIMEOUT_MS, self.go_idle)
+
+    def _finish_loading(self):
+        if self.mode == "loading":  # unless the user already started talking
+            self.go_idle()
 
     def go_idle(self):
         self._idle_job = None
@@ -850,12 +898,29 @@ class ArthurUI:
             c.create_image(ox, oy, image=self.bg_photo, anchor="nw")
 
         # --- panels ---
-        if self.mode == "idle":
+        if self.mode == "loading":
+            self._loading_panel(P, k)
+        elif self.mode == "idle":
             self._panel(P, k, 252, 1204, "TRANSCRIPTION", "Please speak now...")
         else:
             self._panel(P, k, 188, 687, "TRANSCRIPTION",
                         self.transcript or "Please speak now...")
             self._panel(P, k, 769, 1268, "ARTHUR RESPONSE", self.response)
+
+    def _loading_panel(self, P, k):
+        c = self.canvas
+        self._panel(P, k, 252, 1204, "LOADING", self.loading_label)
+        # progress bar: outlined frame with a solid fill inside
+        left, top = P(284, 350)
+        right, bottom = P(1172, 395)
+        c.create_rectangle(left, top, right, bottom, outline=BLUE, width=max(2, 4 * k))
+        pad = 6 * k
+        fill_right = left + pad + (right - left - 2 * pad) * max(0.0, min(1.0, self.progress))
+        if fill_right > left + pad + 1:
+            c.create_rectangle(left + pad, top + pad, fill_right, bottom - pad,
+                               fill=BLUE, outline=BLUE)
+        c.create_text((left + right) / 2, P(0, 440)[1], text=f"{int(self.progress * 100)}%",
+                      fill=BLUE, font=self.font(self.tech, 26 * k, "bold"))
 
     def _panel(self, P, k, x0, x1, title, body):
         c = self.canvas
@@ -902,6 +967,7 @@ def main():
     ArthurUI(root, ui_q)
 
     def worker():
+        ui_q.put(("loading", (0.0, 0.10, "Connecting to server...")))
         check_server()
         try:
             voice_loop(ui_q, stop)
