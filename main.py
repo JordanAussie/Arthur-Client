@@ -57,6 +57,9 @@ VOSK_MODEL_PATH = "vosk-model-small-en-us-0.15"
 SAMPLE_RATE = 16000
 SPEAK_REPLIES = True  # set False to only print replies
 PIPER_VOICE = "en_GB-northern_english_male-medium"  # Piper voice used for speech
+PIPER_VOICE_DIR = None  # folder with the voice .onnx/.json files (None = next to client.py, then the current folder)
+PIPER_USE_CUDA = False  # True = run Piper on an NVIDIA GPU (pip install onnxruntime-gpu)
+PIPER_LENGTH_SCALE = 1.0  # speaking speed: lower = faster (e.g. 0.85), higher = slower
 MIC_UNMUTE_DELAY = 0.4  # seconds to keep the mic muted after Arthur stops talking (room echo)
 
 # Words the speech recognizer might produce when you say "Arthur"
@@ -430,6 +433,182 @@ def speak_with_piper(text):
             pass
 
 
+# Where one sentence ends: . ! ? followed by a space, or a line break
+SENTENCE_END = re.compile(r"(?:[.!?…]+[\"')\]]*\s+|\n+)")
+
+
+def find_voice_file():
+    """Locate the Piper voice (.onnx) so it can be loaded into memory once."""
+    if PIPER_VOICE.endswith(".onnx") and os.path.isfile(PIPER_VOICE):
+        return PIPER_VOICE
+    folders = [PIPER_VOICE_DIR, BASE_DIR, os.getcwd(),
+               os.path.expanduser("~/.local/share/piper")]
+    for folder in folders:
+        if folder:
+            path = os.path.join(folder, PIPER_VOICE + ".onnx")
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+class Speaker:
+    """Fast text-to-speech with Piper.
+
+    Two things make this much quicker than running `python -m piper` per reply:
+      1. The voice is loaded into memory ONCE at startup (not on every reply).
+      2. Speech starts as soon as the first sentence is written - while the AI is
+         still generating the rest - and the next sentence is synthesized while
+         the current one is playing.
+
+    Usage:  begin() -> feed(text_so_far) ... -> end(final_text)
+    If the voice can't be loaded it falls back to the slow command-line method.
+    """
+
+    def __init__(self, on_start=None, on_stop=None):
+        self.enabled = SPEAK_REPLIES
+        self.on_start = on_start or (lambda: None)  # called just before the first sound
+        self.on_stop = on_stop or (lambda: None)    # called after the last sound
+        self.voice = None
+        self.syn_config = None
+        self._active = False
+
+    def load(self):
+        if not self.enabled:
+            return
+        path = find_voice_file()
+        if not path:
+            print(f"[piper] voice file '{PIPER_VOICE}.onnx' not found - using slower "
+                  "command-line mode. Put the .onnx/.json files next to client.py "
+                  "(or set PIPER_VOICE_DIR) for fast mode.")
+            return
+        try:
+            from piper import PiperVoice
+            print("Loading voice...")
+            self.voice = PiperVoice.load(path, use_cuda=PIPER_USE_CUDA)
+            if PIPER_LENGTH_SCALE != 1.0:
+                from piper import SynthesisConfig
+                self.syn_config = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
+            list(self._synth("Ready."))  # warm-up so the first real reply isn't slow
+            print("Voice ready.")
+        except Exception as e:
+            print(f"[piper] fast mode unavailable ({e}); using slower command-line mode.")
+            self.voice = None
+
+    def _synth(self, text):
+        if self.syn_config is not None:
+            return self.voice.synthesize(text, syn_config=self.syn_config)
+        return self.voice.synthesize(text)
+
+    # ---- public API ----
+    def begin(self):
+        if not self.enabled:
+            return
+        self._active = True
+        self._text, self._cut, self._started = "", 0, False
+        if self.voice is None:
+            return  # fallback mode: everything is spoken in end()
+        self._sent_q = queue.Queue()
+        self._audio_q = queue.Queue(maxsize=8)
+        self._threads = [threading.Thread(target=self._synth_loop, daemon=True),
+                         threading.Thread(target=self._play_loop, daemon=True)]
+        for t in self._threads:
+            t.start()
+
+    def feed(self, text):
+        """`text` is everything written so far (not just the new bit)."""
+        if self._active and self.voice is not None:
+            self._text = text
+            self._queue_sentences(final=False)
+
+    def end(self, final_text=None):
+        """Speak whatever is left, wait until the audio has finished, un-mute."""
+        if not self._active:
+            return
+        self._active = False
+
+        if self.voice is None:  # fallback: the old slower method
+            text = (final_text or "").strip()
+            if text:
+                self.on_start()
+                try:
+                    speak_with_piper(text)
+                except Exception as e:
+                    print(f"[piper error] {e}")
+                finally:
+                    self.on_stop()
+            return
+
+        # trust the final text only if it continues what was already queued
+        if final_text is not None and final_text.startswith(self._text[:self._cut]):
+            self._text = final_text
+        self._queue_sentences(final=True)
+        self._sent_q.put(None)
+        for t in self._threads:
+            t.join()
+
+    # ---- internals ----
+    def _queue_sentences(self, final):
+        rest = self._text[self._cut:]
+        while True:
+            m = SENTENCE_END.search(rest)
+            if not m:
+                break
+            sentence = rest[:m.end()].strip()
+            self._cut += m.end()
+            rest = rest[m.end():]
+            if sentence:
+                self._sent_q.put(sentence)
+        if final:
+            self._cut = len(self._text)
+            if rest.strip():
+                self._sent_q.put(rest.strip())
+
+    def _synth_loop(self):
+        try:
+            while True:
+                sentence = self._sent_q.get()
+                if sentence is None:
+                    break
+                for chunk in self._synth(sentence):
+                    self._audio_q.put((chunk.sample_rate, chunk.sample_channels,
+                                       chunk.audio_int16_bytes))
+        except Exception as e:
+            print(f"[piper error] {e}")
+        finally:
+            self._audio_q.put(None)
+
+    def _play_loop(self):
+        stream, failed = None, False
+        try:
+            while True:
+                item = self._audio_q.get()
+                if item is None:
+                    break
+                if failed:
+                    continue  # keep draining so the synth thread never blocks
+                try:
+                    rate, channels, data = item
+                    if stream is None:
+                        self._started = True
+                        self.on_start()  # mute the mic right before the first sound
+                        stream = sd.RawOutputStream(samplerate=rate, channels=channels,
+                                                    dtype="int16")
+                        stream.start()
+                    stream.write(data)
+                except Exception as e:
+                    print(f"[audio error] {e}")
+                    failed = True
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop()  # waits until everything has actually been played
+                    stream.close()
+                except Exception:
+                    pass
+            if self._started:
+                self.on_stop()
+
+
 def voice_loop(ui_q, stop):
     """Listens for the wake word, talks to Arthur, and posts updates to the UI.
 
@@ -440,21 +619,42 @@ def voice_loop(ui_q, stop):
     """
     muted = threading.Event()  # while set, microphone audio is thrown away
 
+    def mic_off():
+        muted.set()  # Arthur is about to talk
+
+    def mic_on():
+        time.sleep(MIC_UNMUTE_DELAY)  # let the room echo die down
+        while not audio_q.empty():
+            audio_q.get_nowait()
+        recognizer.Reset()
+        muted.clear()  # mic is live again
+
+    speaker = Speaker(on_start=mic_off, on_stop=mic_on)
+
     def speak(text):
+        """Say a complete piece of text (e.g. "Yes?")."""
         print(f"Arthur: {text}")
         ui_q.put(("response", text))
-        if SPEAK_REPLIES and text.strip():
-            muted.set()  # mute the mic while Arthur talks
-            try:
-                speak_with_piper(text)  # blocks until the audio has finished
-            except Exception as e:
-                print(f"[piper error] {e}")
-            finally:
-                time.sleep(MIC_UNMUTE_DELAY)  # let the room echo die down
-                while not audio_q.empty():
-                    audio_q.get_nowait()
-                recognizer.Reset()
-                muted.clear()  # mic is live again
+        speaker.begin()
+        speaker.end(text)
+
+    def answer_command(command):
+        """Ask the server and show + speak the reply while it is being written."""
+        ui_q.put(("response", "Thinking..."))
+        speaker.begin()
+
+        def on_text(text):
+            ui_q.put(("response", text))
+            speaker.feed(text)
+
+        try:
+            answer = ask_arthur(command, on_text=on_text)
+        except Exception:
+            speaker.end()  # finish/un-mute cleanly, then let the caller report the error
+            raise
+        print(f"Arthur: {answer}")
+        ui_q.put(("response", answer))
+        speaker.end(answer)
 
     SetLogLevel(-1)
     recognizer = KaldiRecognizer(Model(VOSK_MODEL_PATH), SAMPLE_RATE)
@@ -463,6 +663,8 @@ def voice_loop(ui_q, stop):
     def callback(indata, frames, time_info, status):
         if not muted.is_set():
             audio_q.put(bytes(indata))
+
+    speaker.load()  # load the voice into memory once
 
     awaiting_command = False
     last_partial = ""
@@ -511,8 +713,7 @@ def voice_loop(ui_q, stop):
 
             if command:
                 try:
-                    ui_q.put(("response", "Thinking..."))
-                    speak(ask_arthur(command, on_text=lambda t: ui_q.put(("response", t))))
+                    answer_command(command)
                 except ServerError as e:
                     speak("Sorry, I can't reach my server.")
                     print(f"[server error] {e}")
