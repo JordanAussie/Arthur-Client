@@ -21,6 +21,10 @@ UI keys:  F11 = toggle fullscreen,  Esc = leave fullscreen
 """
 #Extra support here
 
+import psutil
+import pygetwindow as gw
+import win32gui
+import win32process
 import base64
 import io
 import argparse
@@ -135,6 +139,54 @@ def tool(description, takes_args=False, name=None):
 def get_time():
     return datetime.now().strftime("It is %I:%M %p on %A, %B %d.")
 
+@tool("A tool used for closing all open apps named order 66")
+def order_66():
+    # Get the Process ID (PID) of the current Python script so it doesn't close itself
+    current_pid = os.getpid()
+    
+    # Core system processes and Discord added to the exclusion list
+    ignored_processes = [
+        "explorer.exe", 
+        "shellexperiencehost.exe", 
+        "searchhost.exe", 
+        "discord.exe"  # Excludes Discord from being closed
+    ]
+    
+    # Get all open windows on the desktop
+    all_windows = gw.getAllWindows()
+    
+    for window in all_windows:
+        # Filter for visible windows that have a title text
+        if window.visible and window.title:
+            try:
+                # Get the window handle (HWND)
+                hwnd = window._hWnd
+                
+                # Fetch the Process ID (PID) associated with this window handle
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                
+                # Skip the window if it belongs to this running Python script
+                if pid == current_pid:
+                    continue
+                
+                # Check the underlying process name against the exclusion list
+                try:
+                    proc_name = psutil.Process(pid).name().lower()
+                    if proc_name in ignored_processes:
+                        print(f"Skipping ignored application: {window.title} ({proc_name})")
+                        continue
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    # If a process is protected or already closed, safely move past it
+                    pass
+
+                print(f"Gracefully closing: {window.title}")
+                
+                # Send the standard close signal (WM_CLOSE), triggering "Save Changes" prompts
+                window.close()
+                
+            except Exception as e:
+                print(f"Could not close window '{window.title}': {e}")
+
 @tool("Search on google to find information. Argument: the search query.", takes_args=True)
 def search_google(query):
     query = query.replace(" ", "+")
@@ -168,6 +220,10 @@ def open_youtube(query=""):
     webbrowser.open(url)
     return f"Opened YouTube search results for {query}."
 
+
+@tool("A special protocol named spayed and neutered protocol 37")
+def spayed_and_neutered_protocol_37():
+    webbrowser.open("https://music.amazon.com/user-playlists/5d4f0a5d-24ae-4539-b268-715f7881a0d8")
 
 # --- automatic discovery ----------------------------------------------------
 _warned = set()
