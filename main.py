@@ -4,6 +4,11 @@ The AI itself runs on the Arthur server (server.py, next to Ollama).
 
 Say "Arthur" followed by your request (e.g. "Arthur, what time is it?").
 If you only say "Arthur", it answers "Yes?" and listens for your request.
+After that you can keep talking back and forth WITHOUT saying "Arthur" again.
+Say "goodbye" to end the conversation; Arthur then waits for "Arthur" again.
+Say "mute" to make Arthur ignore everything you say; say "unmute" to bring him back.
+While Arthur is answering, say "stop" or "cancel" to cut him off ("mute" cuts him off
+and mutes him). Using headphones avoids him hearing his own voice.
 Your words appear live as you speak. Tools run on THIS machine.
 
 Setup:
@@ -69,7 +74,14 @@ PIPER_LENGTH_SCALE = 1.0  # speaking speed: lower = faster (e.g. 0.85), higher =
 MIC_UNMUTE_DELAY = 0.4  # seconds to keep the mic muted after Arthur stops talking (room echo)
 
 # Words the speech recognizer might produce when you say "Arthur"
-WAKE_WORDS = ["arthur", "author", "arthurs"]
+WAKE_WORDS = ["arthur", "author", "arthurs", "jarvis"]
+
+# Saying one of these ends the conversation (Arthur goes back to waiting for the wake word)
+GOODBYE_PATTERN = re.compile(r"\b(goodbye|good bye|bye)\b")
+
+# Voice mute: while muted Arthur ignores everything except "unmute"
+MUTE_PATTERN = re.compile(r"\bmute\b")
+UNMUTE_PATTERN = re.compile(r"\b(unmute|un mute|on mute|on me|and mute)\b")
 
 # UI
 BLUE = "#1043D8"
@@ -484,6 +496,38 @@ def split_wake_word(text):
     return False, ""
 
 
+def is_goodbye(text):
+    return bool(GOODBYE_PATTERN.search(text.lower()))
+
+
+class Cancelled(Exception):
+    """Raised inside a reply when the user says stop / cancel / mute."""
+
+
+# Words that interrupt Arthur mid-reply. The WHOLE utterance has to be made of these
+# (plus filler like "please"), so Arthur's own voice picked up by the mic doesn't trigger it.
+STOP_WORDS = {"stop", "cancel", "mute"}
+STOP_FILLER = {"please", "it", "now", "that", "talking", "the", "this", "just"}
+
+
+def stop_request(text):
+    """Return "stop", "mute" or None for what was heard while Arthur is replying."""
+    words = [w for w in text.lower().split()
+             if w not in STOP_FILLER and w not in WAKE_WORDS]
+    if not words or any(w not in STOP_WORDS for w in words):
+        return None
+    return "mute" if "mute" in words else "stop"
+
+
+def is_unmute(text):
+    return bool(UNMUTE_PATTERN.search(text.lower()))
+
+
+def is_mute(text):
+    t = text.lower()
+    return bool(MUTE_PATTERN.search(t)) and not is_unmute(t)
+
+
 def speak_with_piper(text):
     """Synthesize `text` with Piper into a temp WAV, then play it and block
     until playback has completely finished.
@@ -554,6 +598,8 @@ class Speaker:
         self.voice = None
         self.syn_config = None
         self._active = False
+        self._stop = threading.Event()  # set by stop() to cut the reply off
+        self._stream = None             # the audio stream currently playing
 
     def load(self):
         if not self.enabled:
@@ -583,7 +629,18 @@ class Speaker:
         return self.voice.synthesize(text)
 
     # ---- public API ----
+    def stop(self):
+        """Cut the current reply off immediately (safe to call from any thread)."""
+        self._stop.set()
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.abort()  # drops whatever audio is still queued
+            except Exception:
+                pass
+
     def begin(self):
+        self._stop.clear()
         if not self.enabled:
             return
         self._active = True
@@ -652,7 +709,11 @@ class Speaker:
                 sentence = self._sent_q.get()
                 if sentence is None:
                     break
+                if self._stop.is_set():
+                    continue  # cancelled: skip the rest, keep draining until the end marker
                 for chunk in self._synth(sentence):
+                    if self._stop.is_set():
+                        break
                     self._audio_q.put((chunk.sample_rate, chunk.sample_channels,
                                        chunk.audio_int16_bytes))
         except Exception as e:
@@ -667,7 +728,7 @@ class Speaker:
                 item = self._audio_q.get()
                 if item is None:
                     break
-                if failed:
+                if failed or self._stop.is_set():
                     continue  # keep draining so the synth thread never blocks
                 try:
                     rate, channels, data = item
@@ -676,12 +737,15 @@ class Speaker:
                         self.on_start()  # mute the mic right before the first sound
                         stream = sd.RawOutputStream(samplerate=rate, channels=channels,
                                                     dtype="int16")
+                        self._stream = stream
                         stream.start()
                     stream.write(data)
                 except Exception as e:
-                    print(f"[audio error] {e}")
+                    if not self._stop.is_set():  # (an abort from stop() is expected)
+                        print(f"[audio error] {e}")
                     failed = True
         finally:
+            self._stream = None
             if stream is not None:
                 try:
                     stream.stop()  # waits until everything has actually been played
@@ -700,17 +764,16 @@ def voice_loop(ui_q, stop):
         ("response", text)    - what Arthur says
         ("idle", None)        - nothing happening (not used here, UI times out itself)
     """
-    muted = threading.Event()  # while set, microphone audio is thrown away
+    muted = threading.Event()  # (unused now: the mic stays live so you can say "stop")
+    busy = threading.Event()          # set while Arthur is thinking / speaking a reply
+    cancel = threading.Event()        # set when the user says stop / cancel / mute
+    needs_reset = threading.Event()   # set when a reply finished: flush the mic buffer
 
     def mic_off():
-        muted.set()  # Arthur is about to talk
+        pass  # the mic stays live while Arthur talks so "stop" can be heard
 
     def mic_on():
         time.sleep(MIC_UNMUTE_DELAY)  # let the room echo die down
-        while not audio_q.empty():
-            audio_q.get_nowait()
-        recognizer.Reset()
-        muted.clear()  # mic is live again
 
     speaker = Speaker(on_start=mic_off, on_stop=mic_on)
 
@@ -727,17 +790,40 @@ def voice_loop(ui_q, stop):
         speaker.begin()
 
         def on_text(text):
+            if cancel.is_set():
+                raise Cancelled()  # closes the connection to the server
             ui_q.put(("response", text))
             speaker.feed(text)
 
         try:
             answer = ask_arthur(command, on_text=on_text)
         except Exception:
-            speaker.end()  # finish/un-mute cleanly, then let the caller report the error
+            speaker.end()  # finish cleanly, then let the caller report the error
             raise
+        if cancel.is_set():
+            speaker.end()
+            raise Cancelled()
         print(f"Arthur: {answer}")
         ui_q.put(("response", answer))
         speaker.end(answer)
+
+    def respond(command):
+        """Runs in its own thread so the main loop can keep listening for "stop"."""
+        try:
+            answer_command(command)
+        except Cancelled:
+            print("[cancelled]")
+        except ServerError as e:
+            print(f"[server error] {e}")
+            if not cancel.is_set():
+                speak("Sorry, I can't reach my server.")
+        except Exception as e:
+            print(f"[error] {e}")
+            if not cancel.is_set():
+                speak("Sorry, something went wrong.")
+        finally:
+            needs_reset.set()
+            busy.clear()
 
     SetLogLevel(-1)
     rec_end = 0.45 if SPEAK_REPLIES else 0.95
@@ -754,7 +840,8 @@ def voice_loop(ui_q, stop):
     speaker.load()  # load the voice into memory once
     ui_q.put(("ready", None))
 
-    awaiting_command = False
+    in_conversation = False  # True from "Arthur" until "goodbye"
+    user_muted = False       # True from "mute" until "unmute" (still listens for "unmute")
     last_partial = ""
     print("Listening... say 'Arthur' to wake me.")
 
@@ -763,16 +850,43 @@ def voice_loop(ui_q, stop):
         channels=1, callback=callback,
     ):
         while not stop.is_set():
+            if needs_reset.is_set():  # a reply just ended: forget any echo of it
+                needs_reset.clear()
+                time.sleep(MIC_UNMUTE_DELAY)
+                while not audio_q.empty():
+                    audio_q.get_nowait()
+                recognizer.Reset()
+                last_partial = ""
             try:
                 data = audio_q.get(timeout=0.2)
             except queue.Empty:
                 continue
+
+            if busy.is_set():
+                # Arthur is replying: the ONLY thing we listen for is stop / cancel / mute
+                if recognizer.AcceptWaveform(data):
+                    heard = json.loads(recognizer.Result()).get("text", "")
+                else:
+                    heard = json.loads(recognizer.PartialResult()).get("partial", "")
+                what = stop_request(heard)
+                if what and not cancel.is_set():
+                    print(f"You: {heard}  -> {what}")
+                    cancel.set()
+                    speaker.stop()
+                    if what == "mute":
+                        user_muted = True
+                        ui_q.put(("muted", True))
+                    else:
+                        ui_q.put(("response", "Stopped."))
+                    recognizer.Reset()
+                continue
+
             if not recognizer.AcceptWaveform(data):
                 # Still mid-sentence: show the words so far, live
                 partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
-                if partial and partial != last_partial:
+                if partial and partial != last_partial and not user_muted:
                     last_partial = partial
-                    if awaiting_command or split_wake_word(partial)[0]:
+                    if in_conversation or split_wake_word(partial)[0]:
                         ui_q.put(("transcript", partial))
                 continue
             last_partial = ""
@@ -782,32 +896,62 @@ def voice_loop(ui_q, stop):
                 continue
             print(f"You: {text}")
 
+            if user_muted:
+                if is_unmute(text):
+                    user_muted = False
+                    ui_q.put(("muted", False))
+                    speak("Unmuted.")
+                    if not in_conversation:
+                        ui_q.put(("idle", None))
+                while not audio_q.empty():
+                    audio_q.get_nowait()
+                recognizer.Reset()
+                last_partial = ""
+                continue
+
             command = None
-            if awaiting_command:
-                command = text
-                awaiting_command = False
+            if in_conversation:
+                # Already talking: no need to say "Arthur" again (but it's harmless if you do)
+                woke, rest = split_wake_word(text)
+                command = rest if woke else text
                 ui_q.put(("transcript", text))
+                # (if they only said "Arthur" mid-conversation, command is empty and we keep listening)
             else:
                 woke, rest = split_wake_word(text)
                 if not woke:
                     continue
                 ui_q.put(("transcript", text))
+                if rest and (is_mute(rest) or is_unmute(rest)):
+                    command = rest  # handled below; doesn't open a conversation
+                else:
+                    in_conversation = True
+                    ui_q.put(("session", True))
                 if rest:
                     command = rest
-                else:
+                elif in_conversation:
                     ui_q.put(("transcript", "Please speak now..."))
                     speak("Yes?")
-                    awaiting_command = True
+
+            if command and is_unmute(command):
+                command = None  # not muted, nothing to undo
+            elif command and is_mute(command):
+                speak("Muted.")
+                user_muted = True
+                ui_q.put(("muted", True))
+                command = None
+
+            if command and is_goodbye(command):
+                speak("Goodbye.")
+                in_conversation = False
+                history.clear()  # next conversation starts fresh
+                ui_q.put(("session", False))
+                ui_q.put(("idle", None))
+                command = None
 
             if command:
-                try:
-                    answer_command(command)
-                except ServerError as e:
-                    speak("Sorry, I can't reach my server.")
-                    print(f"[server error] {e}")
-                except Exception as e:
-                    speak("Sorry, something went wrong.")
-                    print(f"[error] {e}")
+                cancel.clear()
+                busy.set()
+                threading.Thread(target=respond, args=(command,), daemon=True).start()
 
             # Drop audio captured while Arthur was speaking so he doesn't hear himself
             while not audio_q.empty():
@@ -833,6 +977,8 @@ class ArthurUI:
         self.transcript = ""
         self.response = ""
         self._idle_job = None
+        self.session = False  # True while a conversation is open (no idle timeout)
+        self.muted = False    # True while Arthur is voice-muted
         self._fonts = {}
         self._fullscreen = False
 
@@ -888,6 +1034,21 @@ class ArthurUI:
                     self.response = value
                     self._arm_idle_timer()
                     changed = True
+                elif kind == "muted":
+                    self.muted = bool(value)
+                    if self.muted:
+                        if self._idle_job:
+                            self.root.after_cancel(self._idle_job)
+                            self._idle_job = None
+                        self.mode = "muted"
+                    elif self.mode == "muted":
+                        self.mode = "active" if self.session else "idle"
+                    changed = True
+                elif kind == "session":
+                    self.session = bool(value)
+                    if self.session and self._idle_job:
+                        self.root.after_cancel(self._idle_job)
+                        self._idle_job = None
                 elif kind == "idle":
                     self.go_idle()
                 elif kind == "loading":
@@ -919,6 +1080,9 @@ class ArthurUI:
     def _arm_idle_timer(self):
         if self._idle_job:
             self.root.after_cancel(self._idle_job)
+            self._idle_job = None
+        if self.session:
+            return  # conversation is open: stay on the two-panel view until "goodbye"
         self._idle_job = self.root.after(IDLE_TIMEOUT_MS, self.go_idle)
 
     def _finish_loading(self):
@@ -927,6 +1091,8 @@ class ArthurUI:
 
     def go_idle(self):
         self._idle_job = None
+        if self.muted:
+            return  # stay on the MUTED panel until "unmute"
         self.mode = "idle"
         self.transcript = ""
         self.response = ""
@@ -967,6 +1133,8 @@ class ArthurUI:
         # --- panels ---
         if self.mode == "loading":
             self._loading_panel(P, k)
+        elif self.mode == "muted":
+            self._panel(P, k, 252, 1204, "MUTED", "Say 'unmute' to wake me up.")
         elif self.mode == "idle":
             self._panel(P, k, 252, 1204, "TRANSCRIPTION", "Please speak now...")
         else:
